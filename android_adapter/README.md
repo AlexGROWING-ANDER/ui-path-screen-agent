@@ -22,3 +22,35 @@ Remove `--preflight-only` for the isolated smoke run. It writes only under:
 
 `H:/GUI_AGENT_runs/ui_path_screen_agent/kg_rag_v2_hard_intents/gpt56sol_medium/<timestamp>/`
 
+## Android adapter update
+
+The adapter executes UiPath actions through Android ADB. Key presses support
+letters, digits, arrows, `PgUp`, `PgDn`, and combinations such as `Ctrl+A`
+when the connected device exposes `adb shell input keycombination`.
+
+`type_into` continues to use `ADB_INPUT_TEXT`; keypress support is separate
+from text injection. Unsupported key input is recorded as `unsupported_action`,
+while `human_confirmation` is reserved for the external-side-effect safety gate.
+
+For the approved rerun that intentionally allows external effects, pass the
+flag explicitly to the runner:
+
+```powershell
+python -X utf8 android_adapter/run_mobile_uipath.py `
+  --package <package> `
+  --intent-file <intent-file> `
+  --test-id <test-id> `
+  --max-steps 30 `
+  --allow-external-side-effects
+```
+
+For a watcher-driven rerun, pass the same flag to the watcher:
+
+```powershell
+python -X utf8 android_adapter/watch_unipath_resume.py `
+  --until '<local ISO timestamp>' `
+  --allow-external-side-effects
+```
+
+The flag remains disabled by default and must be supplied explicitly.
+

@@ -18,7 +18,7 @@ CONFIG = WORKSPACE / "agent_s/config/experiments_hard_intents.json"
 ADB = Path("D:/Android/platform-tools/adb.exe")
 RESULT_ROOT = Path("H:/GUI_AGENT_runs/ui_path_screen_agent/kg_rag_v2_hard_intents/gpt56sol_medium")
 WATCH_ROOT = RESULT_ROOT / "watch"
-TERMINAL = {"completed", "human_confirmation", "max_steps"}
+TERMINAL = {"completed", "human_confirmation", "max_steps", "unsupported_action"}
 PRIVACY_SKIP_TERMS = ("发送邮件", "发邮件", "邮件发送", "发送一封邮件", "send email", "send an email", "send mail")
 
 
@@ -28,6 +28,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=30)
     parser.add_argument("--max-attempts", type=int, default=2)
     parser.add_argument("--task-timeout-seconds", type=int, default=2700)
+    parser.add_argument("--allow-external-side-effects", action="store_true",
+                        help="Explicitly allow sends, shares, posts, deletes, and other external effects")
     return parser.parse_args()
 
 
@@ -122,6 +124,17 @@ def stop_tree(pid: int) -> None:
     subprocess.run(["taskkill.exe", "/PID", str(pid), "/T", "/F"], capture_output=True)
 
 
+def runner_command(task: dict, max_steps: int, allow_external_side_effects: bool) -> list[str]:
+    command = [
+        str(PYTHON), "-u", "-X", "utf8", str(RUNNER),
+        "--package", task["package"], "--intent-file", task["intent_file"],
+        "--test-id", task["test_id"], "--max-steps", str(max_steps),
+    ]
+    if allow_external_side_effects:
+        command.append("--allow-external-side-effects")
+    return command
+
+
 def main() -> int:
     args = parse_args()
     deadline = dt.datetime.fromisoformat(args.until)
@@ -180,11 +193,7 @@ def main() -> int:
         key = f"{task['package']}/{task['test_id']}"
         attempts[key] = attempts.get(key, 0) + 1
         log_base = watch / f"{task['package']}_{task['test_id']}_attempt_{attempts[key]}"
-        command = [
-            str(PYTHON), "-u", "-X", "utf8", str(RUNNER),
-            "--package", task["package"], "--intent-file", task["intent_file"],
-            "--test-id", task["test_id"], "--max-steps", str(args.max_steps),
-        ]
+        command = runner_command(task, args.max_steps, args.allow_external_side_effects)
         with log_base.with_suffix(".stdout.log").open("w", encoding="utf-8") as stdout, \
              log_base.with_suffix(".stderr.log").open("w", encoding="utf-8") as stderr:
             child = subprocess.Popen(command, cwd=WORKSPACE, stdout=stdout, stderr=stderr)

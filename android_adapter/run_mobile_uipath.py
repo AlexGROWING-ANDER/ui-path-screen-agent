@@ -147,18 +147,71 @@ def execute_action(adb: Path, action: dict, allow_side_effects: bool) -> tuple[b
         start, end = path[0], path[-1]
         adb_run(adb, "shell", "input", "swipe", str(start["x"]), str(start["y"]), str(end["x"]), str(end["y"]), "700")
     elif name == "keypress":
-        keys = [str(k).lower() for k in params.get("keys", [])]
-        mapping = {"back": "4", "enter": "66", "home": "3", "esc": "4", "del": "67"}
-        for key in keys:
-            if key in mapping:
-                adb_run(adb, "shell", "input", "keyevent", mapping[key])
-            else:
-                return True, f"unsupported_key:{key}"
+        return execute_keypress(adb, params.get("keys", []))
     elif name in {"wait_load_completed", "mouse_move"}:
         time.sleep(2)
     else:
         return True, f"unsupported_action:{name}"
     return False, "executed"
+
+
+def execute_keypress(adb: Path, keys: list[str] | str) -> tuple[bool, str]:
+    """Execute UiPath key names through Android's input command."""
+    aliases = {
+        "control": "ctrl", "ctrlleft": "ctrl", "ctrlright": "ctrl",
+        "return": "enter", "escape": "esc", "pagedown": "pgdn",
+        "page_down": "pgdn", "pageup": "pgup", "page_up": "pgup",
+        "arrowleft": "left", "arrowright": "right", "arrowup": "up",
+        "arrowdown": "down", "backspace": "del",
+    }
+    values = [keys] if isinstance(keys, str) else keys
+    normalized = []
+    for raw in values:
+        for token in re.split(r"\s*\+\s*|\s+", str(raw).strip()):
+            if token:
+                normalized.append(aliases.get(token.lower(), token.lower()))
+    mapping = {
+        "back": 4, "enter": 66, "home": 3, "esc": 4, "del": 67,
+        "delete": 112, "tab": 61, "space": 62, "left": 21, "right": 22,
+        "up": 19, "down": 20, "pgup": 92, "pgdn": 93,
+        "ctrl": 113, "shift": 59, "alt": 57, "meta": 117,
+        "end": 123, "move_home": 122, "insert": 124, "@": 77,
+    }
+    mapping.update({chr(97 + index): 29 + index for index in range(26)})
+    mapping.update({str(index): 7 + index for index in range(10)})
+    mapping.update({f"f{index}": 130 + index for index in range(1, 13)})
+    if not normalized:
+        return True, "invalid_keypress:empty"
+    for key in normalized:
+        if key not in mapping:
+            return True, f"unsupported_key:{key}"
+
+    modifiers = {"ctrl", "shift", "alt", "meta"}
+    if any(key in modifiers for key in normalized):
+        if not any(key not in modifiers for key in normalized):
+            return True, "invalid_keypress:modifier_without_key"
+        help_result = adb_run(adb, "shell", "input", "help")
+        help_text = (help_result.stdout or "") + (help_result.stderr or "")
+        if "keycombination" not in help_text:
+            return True, "unsupported_keycombination:device_input_command"
+        command = "keycombination"
+    else:
+        command = "keyevent"
+    result = adb_run(adb, "shell", "input", command, *[str(mapping[key]) for key in normalized])
+    if result.returncode:
+        raise RuntimeError("ADB keypress failed")
+    return False, "executed"
+
+
+def result_status(reason: str) -> str:
+    if reason == "finished":
+        return "completed"
+    if reason.startswith("human_confirmation_required:"):
+        return "human_confirmation"
+    if reason.startswith(("unsupported_key:", "unsupported_keycombination:",
+                          "invalid_keypress:", "unsupported_action:")):
+        return "unsupported_action"
+    return "max_steps"
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -242,7 +295,7 @@ async def run(args: argparse.Namespace) -> int:
                 break
         previous_steps.append(step)
         if stop:
-            status = "completed" if reason == "finished" else "human_confirmation"
+            status = result_status(reason)
             break
         time.sleep(2)
 
