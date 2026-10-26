@@ -28,8 +28,9 @@ The adapter executes UiPath actions through Android ADB. Key presses support
 letters, digits, arrows, `PgUp`, `PgDn`, and combinations such as `Ctrl+A`
 when the connected device exposes `adb shell input keycombination`.
 
-`type_into` continues to use `ADB_INPUT_TEXT`; keypress support is separate
-from text injection. Unsupported key input is recorded as `unsupported_action`,
+`type_into` now matches the active keyboard protocol and verifies visible text
+after whole-string input; see [v4 details](../docs/android-input-v4.md).
+Unsupported key input is recorded as `unsupported_action`,
 while `human_confirmation` is reserved for the external-side-effect safety gate.
 
 For the approved rerun that intentionally allows external effects, pass the

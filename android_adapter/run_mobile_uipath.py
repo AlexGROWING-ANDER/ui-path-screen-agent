@@ -8,8 +8,10 @@ and are never written to the output directory or command line.
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 import base64
+import copy
 import datetime as dt
 import json
 import os
@@ -19,11 +21,17 @@ import sys
 import time
 from pathlib import Path
 
-WORKSPACE = Path(__file__).resolve().parents[1]
-UIPATH_REPO = Path("H:/GUI_AGENT_OSWorld/OSWorld-v1")
+from android_text_input import TextInputError, write_verified_text
+
+WORKSPACE = Path(os.environ.get('UIPATH_WORKSPACE', str(Path(__file__).resolve().parents[1])))
+UIPATH_REPO = Path(os.environ.get('UIPATH_REPO', 'H:/GUI_AGENT_OSWorld/OSWorld-v1'))
 MOBILE_AGENT = WORKSPACE / "mobile_agent_v3/mobile_v3"
+sys.path.insert(0,str(MOBILE_AGENT))
+from communication_permissions import authorized_communication
 DEFAULT_ADB = Path("D:/Android/platform-tools/adb.exe")
 DEFAULT_OUTPUT = Path("H:/GUI_AGENT_runs/ui_path_screen_agent/kg_rag_v2_hard_intents/gpt56sol_medium")
+ADAPTER_VERSION = "android-input-verified-v4-20261026"
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 SIDE_EFFECT_TERMS = (
     "发送", "分享", "发布", "评论", "下单", "购买", "付款", "支付", "转账",
     "删除", "注销", "提交订单", "确认收货",
@@ -51,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adb", type=Path, default=DEFAULT_ADB)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--allow-external-side-effects", action="store_true")
+    parser.add_argument('--allow-communications',action='store_true',help='Allow task-directed sending/publishing, without permitting payments')
     parser.add_argument("--runtime-only", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
     return parser.parse_args()
@@ -74,7 +83,8 @@ def load_intent(path: Path, test_id: str) -> str:
 def adb_run(adb: Path, *args: str, binary: bool = False) -> subprocess.CompletedProcess:
     return subprocess.run(
         [str(adb), *args], capture_output=True, check=False,
-        text=not binary, timeout=30,
+        text=not binary, encoding=None if binary else "utf-8",
+        errors=None if binary else "replace", timeout=30, creationflags=NO_WINDOW,
     )
 
 
@@ -102,34 +112,124 @@ def screenshot(adb: Path, path: Path) -> bytes:
 
 def tap(adb: Path, x: int, y: int, count: int = 1) -> None:
     for _ in range(count):
-        adb_run(adb, "shell", "input", "tap", str(x), str(y))
+        result = adb_run(adb, "shell", "input", "tap", str(x), str(y))
+        if result.returncode:
+            raise RuntimeError("ADB tap failed")
         time.sleep(0.12)
 
 
-def type_text(adb: Path, value: str) -> None:
-    # ADB Keyboard is already installed for the GUI-agent experiments and its
-    # broadcast path supports Chinese/Unicode without a uiautomator2 dependency.
-    result = adb_run(adb, "shell", "am", "broadcast", "-a", "ADB_INPUT_TEXT", "--es", "msg", value)
-    if result.returncode != 0:
-        raise RuntimeError("ADB Keyboard text broadcast failed")
-    time.sleep(0.5)
+def ensure_adb_keyboard(adb: Path) -> str:
+    current = adb_run(adb, "shell", "settings", "get", "secure", "default_input_method")
+    if current.returncode:
+        raise RuntimeError("ADB input-method query failed")
+    if "adbkeyboard" not in (current.stdout or "").lower():
+        installed = adb_run(adb, "shell", "ime", "list", "-s")
+        choices = [line.strip() for line in (installed.stdout or "").splitlines()
+                   if "adbkeyboard" in line.lower() and "/" in line]
+        if installed.returncode or len(choices) != 1:
+            raise RuntimeError("ADB Keyboard IME unavailable; text was not sent")
+        for command in ("enable", "set"):
+            switched = adb_run(adb, "shell", "ime", command, choices[0])
+            if switched.returncode:
+                raise RuntimeError("ADB Keyboard IME activation failed")
+        confirmed = adb_run(adb, "shell", "settings", "get", "secure", "default_input_method")
+        if confirmed.returncode or "adbkeyboard" not in (confirmed.stdout or "").lower():
+            raise RuntimeError("ADB Keyboard IME activation was not confirmed")
+        current = confirmed
+    return (current.stdout or '').strip()
 
 
-def execute_action(adb: Path, action: dict, allow_side_effects: bool) -> tuple[bool, str]:
+def type_text(adb: Path, value: str) -> dict:
+    return write_verified_text(adb, value, adb_run, ensure_adb_keyboard, time.sleep)
+
+
+def normalize_keys(keys: object) -> list[str]:
+    """Accept native lists, JSON/Python list strings, and Ctrl+A/Ctrl A."""
+    if isinstance(keys, str) and keys.strip().startswith("["):
+        try:
+            keys = ast.literal_eval(keys.strip())
+        except (ValueError, SyntaxError):
+            return []
+    if not isinstance(keys, (str, list, tuple)):
+        return []
+    aliases = {"control": "ctrl", "ctrlleft": "ctrl", "ctrlright": "ctrl",
+               "return": "enter", "escape": "esc", "pagedown": "pgdn",
+               "page_down": "pgdn", "pageup": "pgup", "page_up": "pgup",
+               "arrowleft": "left", "arrowright": "right", "arrowup": "up",
+               "arrowdown": "down", "backspace": "del"}
+    values = [keys] if isinstance(keys, str) else keys
+    normalized = []
+    for raw in values:
+        if not isinstance(raw, str):
+            return []
+        for token in re.split(r"\s*\+\s*|\s+", raw.strip()):
+            if token:
+                normalized.append(aliases.get(token.lower(), token.lower()))
+    return normalized
+
+
+def execution_actions(step: dict) -> list[dict]:
+    """Preserve the model response; repair only upstream key-name conversion."""
+    actions = copy.deepcopy(step.get("actions", []))
+    raw_plan = (step.get("additional_parameters") or {}).get("plan_action", {})
+    try:
+        plan = json.loads(raw_plan) if isinstance(raw_plan, str) else raw_plan
+    except (ValueError, TypeError):
+        plan = {}
+    if isinstance(plan, dict) and plan.get("type") == "key_press":
+        raw_key = (plan.get("parameters") or {}).get("key")
+        # Use the structured original key, never prose instructions that may
+        # contain a second, unplanned operation. Backspace != Android Back.
+        if raw_key is not None and len(actions) == 1 and actions[0].get("method_type") == "keypress":
+            actions[0].setdefault("parameters", {})["keys"] = raw_key
+    return actions
+
+
+def requires_confirmation(action: dict, allow_side_effects: bool, allow_communications: bool = False) -> bool:
+    name = str(action.get("method_type", ""))
+    description = str(action.get("description", ""))
+    # These action types cannot submit a remote write by themselves. In
+    # particular a finish summary mentioning 'deleted' is not a delete action.
+    if name in {"finish", "scroll", "mouse_move", "wait_load_completed", "type_into"}:
+        return False
+    if name == "keypress":
+        keys = normalize_keys((action.get("parameters") or {}).get("keys", []))
+        local_keys = {"back", "esc", "left", "right", "up", "down",
+                      "home", "end", "move_home", "pgup", "pgdn", "tab"}
+        if keys and (all(k in local_keys for k in keys) or keys == ["ctrl", "a"]):
+            return False
+        if keys and all(k in {"del", "delete"} for k in keys) and re.search(
+                r"搜索框|输入框|文本框|编辑框|姓名|名称|文字|文本|字符|text|input|search", description, re.I):
+            return False
+    if name == "click" and re.search(r"搜索框|输入框|文本框|编辑框|名称框|姓名栏|text field|input field|search box", description, re.I):
+        if re.search(r"清空|清除|删除|clear|erase|delete", description, re.I) and not re.search(r"账号|账户|account|历史记录|购物车", description, re.I):
+            return False
+    if allow_side_effects or (allow_communications and authorized_communication(description)):
+        return False
+    return any(term in description for term in SIDE_EFFECT_TERMS) or bool(
+        re.search(r"\b(send|share|publish|post|comment|delete|purchase|pay|checkout)\b", description, re.I))
+
+
+def execute_action(adb: Path, action: dict, allow_side_effects: bool, allow_communications: bool = False) -> tuple[bool, str]:
     name = str(action.get("method_type", ""))
     params = action.get("parameters") or {}
-    description = str(action.get("description", ""))
-    if not allow_side_effects and any(term in description for term in SIDE_EFFECT_TERMS):
-        return True, f"human_confirmation_required:{description}"
-
     if name == "finish":
         return True, "finished"
+    supported = {"click", "type_into", "scroll", "drag", "keypress", "wait_load_completed", "mouse_move"}
+    if name not in supported:
+        return True, f"unsupported_action:{name}"
+    if requires_confirmation(action, allow_side_effects, allow_communications):
+        return True, f"human_confirmation_required:{action.get('description', '')}"
     if name == "click":
         x, y = map(int, params["position"])
         click_type = params.get("click_type", "single")
         tap(adb, x, y, {"double": 2, "triple": 3}.get(click_type, 1))
     elif name == "type_into":
-        type_text(adb, str(params.get("value", "")))
+        try:
+            action["adapter_execution"] = type_text(adb, str(params.get("value", "")))
+        except TextInputError as exc:
+            action["adapter_execution"] = exc.details
+            return True, f"input_execution_error:{exc.code}"
     elif name == "scroll":
         x, y = map(int, params.get("position", [500, 1000]))
         direction = str(params.get("direction", "down")).lower()
@@ -141,11 +241,15 @@ def execute_action(adb: Path, action: dict, allow_side_effects: bool) -> tuple[b
             "right": (max(50, x - distance), y),
         }
         x2, y2 = ends.get(direction, ends["down"])
-        adb_run(adb, "shell", "input", "swipe", str(x), str(y), str(x2), str(y2), "500")
+        result = adb_run(adb, "shell", "input", "swipe", str(x), str(y), str(x2), str(y2), "500")
+        if result.returncode:
+            raise RuntimeError("ADB scroll failed")
     elif name == "drag":
         path = params["path"]
         start, end = path[0], path[-1]
-        adb_run(adb, "shell", "input", "swipe", str(start["x"]), str(start["y"]), str(end["x"]), str(end["y"]), "700")
+        result = adb_run(adb, "shell", "input", "swipe", str(start["x"]), str(start["y"]), str(end["x"]), str(end["y"]), "700")
+        if result.returncode:
+            raise RuntimeError("ADB drag failed")
     elif name == "keypress":
         return execute_keypress(adb, params.get("keys", []))
     elif name in {"wait_load_completed", "mouse_move"}:
@@ -155,49 +259,34 @@ def execute_action(adb: Path, action: dict, allow_side_effects: bool) -> tuple[b
     return False, "executed"
 
 
-def execute_keypress(adb: Path, keys: list[str] | str) -> tuple[bool, str]:
-    """Execute UiPath key names through Android's input command."""
-    aliases = {
-        "control": "ctrl", "ctrlleft": "ctrl", "ctrlright": "ctrl",
-        "return": "enter", "escape": "esc", "pagedown": "pgdn",
-        "page_down": "pgdn", "pageup": "pgup", "page_up": "pgup",
-        "arrowleft": "left", "arrowright": "right", "arrowup": "up",
-        "arrowdown": "down", "backspace": "del",
-    }
-    values = [keys] if isinstance(keys, str) else keys
-    normalized = []
-    for raw in values:
-        for token in re.split(r"\s*\+\s*|\s+", str(raw).strip()):
-            if token:
-                normalized.append(aliases.get(token.lower(), token.lower()))
-    mapping = {
-        "back": 4, "enter": 66, "home": 3, "esc": 4, "del": 67,
-        "delete": 112, "tab": 61, "space": 62, "left": 21, "right": 22,
-        "up": 19, "down": 20, "pgup": 92, "pgdn": 93,
-        "ctrl": 113, "shift": 59, "alt": 57, "meta": 117,
-        "end": 123, "move_home": 122, "insert": 124, "@": 77,
-    }
-    mapping.update({chr(97 + index): 29 + index for index in range(26)})
-    mapping.update({str(index): 7 + index for index in range(10)})
-    mapping.update({f"f{index}": 130 + index for index in range(1, 13)})
+def execute_keypress(adb: Path, keys: list[str]) -> tuple[bool, str]:
+    """Validate the entire action before sending Android key events."""
+    normalized = normalize_keys(keys)
+    mapping = {"back": 4, "enter": 66, "home": 3, "esc": 4, "del": 67,
+               "delete": 112, "tab": 61, "space": 62, "left": 21, "right": 22,
+               "up": 19, "down": 20, "pgup": 92, "pgdn": 93,
+               "ctrl": 113, "shift": 59, "alt": 57, "meta": 117,
+               "end": 123, "move_home": 122, "insert": 124,
+               "@": 77}
+    mapping.update({chr(97 + n): 29 + n for n in range(26)})
+    mapping.update({str(n): 7 + n for n in range(10)})
+    mapping.update({f"f{n}": 130 + n for n in range(1, 13)})
     if not normalized:
         return True, "invalid_keypress:empty"
     for key in normalized:
         if key not in mapping:
             return True, f"unsupported_key:{key}"
-
     modifiers = {"ctrl", "shift", "alt", "meta"}
-    if any(key in modifiers for key in normalized):
-        if not any(key not in modifiers for key in normalized):
+    if any(k in modifiers for k in normalized):
+        if not any(k not in modifiers for k in normalized):
             return True, "invalid_keypress:modifier_without_key"
         help_result = adb_run(adb, "shell", "input", "help")
-        help_text = (help_result.stdout or "") + (help_result.stderr or "")
-        if "keycombination" not in help_text:
+        if "keycombination" not in ((help_result.stdout or "") + (help_result.stderr or "")):
             return True, "unsupported_keycombination:device_input_command"
         command = "keycombination"
     else:
         command = "keyevent"
-    result = adb_run(adb, "shell", "input", command, *[str(mapping[key]) for key in normalized])
+    result = adb_run(adb, "shell", "input", command, *[str(mapping[k]) for k in normalized])
     if result.returncode:
         raise RuntimeError("ADB keypress failed")
     return False, "executed"
@@ -211,6 +300,10 @@ def result_status(reason: str) -> str:
     if reason.startswith(("unsupported_key:", "unsupported_keycombination:",
                           "invalid_keypress:", "unsupported_action:")):
         return "unsupported_action"
+    if reason.startswith("device_execution_error:"):
+        return "device_execution_error"
+    if reason.startswith("input_execution_error:"):
+        return "input_error"
     return "max_steps"
 
 
@@ -265,6 +358,9 @@ async def run(args: argparse.Namespace) -> int:
         "device": serial,
         "max_steps": args.max_steps,
         "started_at": dt.datetime.now().isoformat(),
+        "adapter_version": ADAPTER_VERSION,
+        "permissions": {"allow_external_side_effects": args.allow_external_side_effects,
+                        "allow_communications": getattr(args, "allow_communications", False)},
     }
     (out / "task_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -289,10 +385,25 @@ async def run(args: argparse.Namespace) -> int:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
         stop = False
-        for action in step.get("actions", []):
-            stop, reason = execute_action(args.adb, action, args.allow_external_side_effects)
+        for action in execution_actions(step):
+            try:
+                stop, reason = execute_action(args.adb, action, args.allow_external_side_effects, getattr(args,'allow_communications',False))
+            except (RuntimeError, OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as exc:
+                stop, reason = True, f"device_execution_error:{type(exc).__name__}"
+            # Keep a compact execution journal apart from the untouched model
+            # response, including before-execution stops and key corrections.
+            with (out / "action_execution.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"step": index, "action": action, "stop": stop,
+                                         "reason": reason, "adapter_version": ADAPTER_VERSION}, ensure_ascii=False) + "\n")
             if stop:
                 break
+        # Capture the final observation even when the last input failed, so it
+        # is reviewable without a nonexistent next model step.
+        try:
+            screenshot(args.adb, out / f"after_step_{index:02d}.png")
+        except (RuntimeError, OSError, subprocess.SubprocessError, ValueError):
+            with (out / "action_execution.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"step": index, "after_screenshot_unavailable": True}) + "\n")
         previous_steps.append(step)
         if stop:
             status = result_status(reason)

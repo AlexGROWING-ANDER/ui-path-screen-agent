@@ -1,4 +1,5 @@
 import sys
+import argparse
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -29,9 +30,12 @@ class AndroidAdapterTests(unittest.TestCase):
 
     def test_watcher_forwards_explicit_side_effect_permission(self):
         task = {"package": "example.app", "intent_file": "intent.json", "test_id": "test_1"}
-        command = watcher.runner_command(task, 30, True)
+        args = argparse.Namespace(max_steps=30,allow_external_side_effects=True,allow_email_tasks=False,
+                                  rerun_selection=None,rerun_gated=False,rerun_keypress=False)
+        command = watcher.build_runner_command(args, task, Path('results'))
         self.assertIn("--allow-external-side-effects", command)
-        self.assertNotIn("--allow-external-side-effects", watcher.runner_command(task, 30, False))
+        args.allow_external_side_effects=False
+        self.assertNotIn("--allow-external-side-effects", watcher.build_runner_command(args, task, Path('results')))
 
 
 if __name__ == "__main__":
