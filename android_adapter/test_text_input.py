@@ -110,7 +110,8 @@ class VerifiedInputTests(unittest.TestCase):
         d=FakeDevice([field(),field(),field(rid='recipient')])
         with self.assertRaisesRegex(text_input.TextInputError,'input_focus_changed_after_send'):
             self.write(d,'hello')
-        self.assertEqual(len(d.commands),1)
+        # A diagnostic dump may run, but the payload must never be sent twice.
+        self.assertEqual(sum('broadcast' in c for c in d.commands),1)
 
     def test_ime_switch_must_not_change_target_or_text(self):
         d=FakeDevice([field(),field(rid='other')])
@@ -141,7 +142,8 @@ class VerifiedInputTests(unittest.TestCase):
         with patch.object(text_input,'read_focused_field',side_effect=[field(),field(),text_input.TextInputError('input_hierarchy_unavailable')]):
             with self.assertRaisesRegex(text_input.TextInputError,'input_readback_unavailable'):
                 text_input.write_verified_text(Path('adb'),'hello',d.run,lambda a:None,lambda t:None)
-        self.assertEqual(len(d.commands),1)
+        # A diagnostic dump may run, but the payload must never be sent twice.
+        self.assertEqual(sum('broadcast' in c for c in d.commands),1)
 
     def test_visible_change_with_lost_receipt_is_not_duplicated(self):
         class Bad:
@@ -167,6 +169,69 @@ class VerifiedInputTests(unittest.TestCase):
     def test_field_resize_is_ok_when_unique_id_is_stable(self):
         d=FakeDevice([field(),field(bounds='[0,0][100,50]'),field('hello',bounds='[0,0][100,50]')])
         self.assertTrue(self.write(d,'hello')['verified'])
+
+    def test_opaque_focused_view_is_accepted_without_readback(self):
+        # A browser search bar painted by a plain View: focused+focusable but
+        # no editable attribute, no text and no children.
+        xml=('<?xml version="1.0"?><hierarchy><node class="android.view.View" '
+             'resource-id="app:id/search_frame_input_bar" package="app" text="" '
+             'focused="true" focusable="true" clickable="true" enabled="true" '
+             'bounds="[291,195][774,266]"/></hierarchy>')
+        parsed=text_input.parse_focused_field(xml)
+        self.assertTrue(parsed.opaque)
+        self.assertEqual(parsed.resource_id,'app:id/search_frame_input_bar')
+        with self.assertRaisesRegex(text_input.TextInputError,'input_focus_missing_or_ambiguous'):
+            text_input.parse_focused_field(xml.replace('focusable="true"','focusable="false"'))
+
+    def test_focused_webview_is_never_an_opaque_text_target(self):
+        xml=('<?xml version="1.0"?><hierarchy><node class="android.webkit.WebView" '
+             'package="app" text="" focused="true" focusable="true" clickable="true" '
+             'enabled="true" bounds="[0,114][1080,2268]"/></hierarchy>')
+        with self.assertRaisesRegex(text_input.TextInputError,'input_focus_missing_or_ambiguous'):
+            text_input.parse_focused_field(xml)
+
+
+    def test_opaque_target_reports_sent_not_verified_text(self):
+        opaque=text_input.FocusedField('app','app:id/bar','android.view.View','[0,0][100,60]','',False,True)
+        d=FakeDevice([opaque,opaque,opaque])
+        with patch.object(text_input,'read_focused_field',side_effect=[opaque,opaque,opaque]):
+            info=text_input.write_verified_text(Path('adb'),'豆包',d.run,lambda a:'com.github.uiautomator/.AdbKeyboard',lambda t:None)
+        self.assertTrue(info['verified'])
+        self.assertEqual(info['verification'],'sent_opaque_target')
+        self.assertFalse(info['text_observable'])
+        self.assertEqual(sum('broadcast' in c for c in d.commands),1)
+
+    def test_auto_submit_navigation_verifies_payload_on_new_screen(self):
+        d=FakeDevice([field(),field()])
+        with patch.object(text_input,'read_focused_field',side_effect=[field(),field(),text_input.TextInputError('input_focus_missing_or_ambiguous')]), \
+             patch.object(text_input,'hierarchy_contains',return_value=True) as probe:
+            info=text_input.write_verified_text(Path('adb'),'极锐数码',d.run,lambda a:'com.github.uiautomator/.AdbKeyboard',lambda t:None)
+        self.assertTrue(info['verified'])
+        self.assertEqual(info['verification'],'text_visible_in_hierarchy')
+        probe.assert_called_once()
+        self.assertEqual(sum('broadcast' in c for c in d.commands),1)
+
+    def test_autocomplete_text_view_is_a_recognised_input(self):
+        # Mail clients use MultiAutoCompleteTextView for the recipient line;
+        # its class never contains the literal "EditText".
+        xml=('<?xml version="1.0"?><hierarchy>'
+             '<node class="android.widget.MultiAutoCompleteTextView" package="app" '
+             'text="" focused="true" focusable="true" enabled="true" bounds="[237,299][972,351]"/>'
+             '</hierarchy>')
+        parsed=text_input.parse_focused_field(xml)
+        self.assertFalse(parsed.opaque)
+        self.assertEqual(parsed.class_name,'android.widget.MultiAutoCompleteTextView')
+
+    def test_two_focused_inputs_prefer_the_populated_one(self):
+        xml=('<?xml version="1.0"?><hierarchy>'
+             '<node class="android.widget.MultiAutoCompleteTextView" package="app" text="donglaixu99@qq.com" '
+             'focused="true" focusable="true" enabled="true" bounds="[237,299][972,351]"/>'
+             '<node class="android.widget.EditText" package="app" text="" '
+             'focused="true" focusable="true" enabled="true" bounds="[60,801][1044,858]"/>'
+             '</hierarchy>')
+        parsed=text_input.parse_focused_field(xml)
+        self.assertEqual(parsed.class_name,'android.widget.MultiAutoCompleteTextView')
+        self.assertEqual(parsed.text,'donglaixu99@qq.com')
 
 
 if __name__=='__main__':unittest.main()

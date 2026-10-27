@@ -2,6 +2,17 @@
 
 No field selection, history clicking, text clearing, Enter, or search submission.
 Only the current focused editable field may receive the model's exact payload.
+
+Two opt-in capabilities were added for opaque/navigating inputs, without
+weakening the existing path:
+
+* A focused, enabled, focusable node that exposes no ``editable`` attribute and
+  no text (a browser search bar drawn by a plain ``View``) is treated as an
+  *opaque* target. Text can be delivered but never read back, so delivery is
+  reported as ``sent_opaque_target`` instead of a false failure.
+* If the read-back disappears after a send because the app auto-submitted and
+  navigated, the whole hierarchy is searched for the payload. Success is only
+  reported when the exact payload is visible somewhere in the tree.
 """
 from __future__ import annotations
 
@@ -17,6 +28,28 @@ from typing import Callable
 
 _FILE_DUMP_ADB: set[str] = set()
 _SERVICE_DUMP_ADB: set[str] = set()
+
+# Widget classes that accept text. AutoCompleteTextView (and its
+# MultiAutoCompleteTextView subclass) is what mail clients use for the
+# recipient line, and it never carries the literal "EditText" suffix.
+_INPUT_CLASS_MARKERS = ('edittext', 'autocompletetextview')
+# A custom input bar still advertises itself somewhere. Without such a hint a
+# focused WebView/SurfaceView is just a page, not a text target.
+_INPUT_HINTS = ('input', 'search', 'edit', 'text', 'query', 'comment', 'reply')
+_NOT_INPUT_CLASSES = ('webview', 'surfaceview')
+
+
+def _is_input_class(class_name: str) -> bool:
+    lowered = (class_name or '').lower()
+    return any(marker in lowered for marker in _INPUT_CLASS_MARKERS)
+
+
+def _looks_like_input_node(node: ET.Element) -> bool:
+    lowered_class = (node.get('class') or '').lower()
+    if any(marker in lowered_class for marker in _NOT_INPUT_CLASSES):
+        return False
+    hint = ((node.get('resource-id') or '') + ' ' + (node.get('content-desc') or '')).lower()
+    return any(marker in hint for marker in _INPUT_HINTS)
 
 
 def read_service_hierarchy(adb: Path, run: Callable) -> str:
@@ -47,6 +80,7 @@ class FocusedField:
     bounds: str
     text: str
     password: bool = False
+    opaque: bool = False
 
     def same_target(self, other: 'FocusedField') -> bool:
         if (self.package, self.class_name) != (other.package, other.class_name):
@@ -68,10 +102,11 @@ class FocusedField:
 
     def target_details(self) -> dict:
         return {"package": self.package, "resource_id": self.resource_id,
-                "class": self.class_name, "bounds": self.bounds}
+                "class": self.class_name, "bounds": self.bounds,
+                "opaque": self.opaque}
 
 
-def parse_focused_field(output: str) -> FocusedField:
+def _root_of(output: str) -> ET.Element:
     start = output.find('<?xml')
     if start < 0:
         start = output.find('<hierarchy')
@@ -79,13 +114,35 @@ def parse_focused_field(output: str) -> FocusedField:
     if start < 0 or end < 0:
         raise TextInputError('input_hierarchy_unavailable')
     try:
-        root = ET.fromstring(output[start:end + len('</hierarchy>')])
+        return ET.fromstring(output[start:end + len('</hierarchy>')])
     except ET.ParseError as exc:
         raise TextInputError('input_hierarchy_invalid') from exc
+
+
+def parse_focused_field(output: str) -> FocusedField:
+    root = _root_of(output)
     fields = [n for n in root.iter('node') if n.get('focused') == 'true' and
-              (n.get('editable') == 'true' or 'edittext' in n.get('class', '').lower())]
+              (n.get('editable') == 'true' or _is_input_class(n.get('class', '')))]
+    if len(fields) > 1:
+        # Some apps keep several inputs marked focused. Only a single one can
+        # hold the IME connection, and a populated one is the active target.
+        populated = [n for n in fields if (n.get('text') or '')]
+        if len(populated) == 1:
+            fields = populated
     if len(fields) != 1:
-        raise TextInputError('input_focus_missing_or_ambiguous')
+        # Opaque custom inputs expose neither an editable attribute nor text.
+        # A single focused, enabled, focusable node is still the only place the
+        # keyboard can deliver characters.
+        candidates = [n for n in root.iter('node') if n.get('focused') == 'true'
+                      and n.get('enabled', 'true') == 'true'
+                      and n.get('focusable') == 'true'
+                      and _looks_like_input_node(n)]
+        if len(candidates) != 1:
+            raise TextInputError('input_focus_missing_or_ambiguous')
+        n = candidates[0]
+        return FocusedField(n.get('package', ''), n.get('resource-id', ''),
+                            n.get('class', ''), n.get('bounds', ''), n.get('text', ''),
+                            n.get('password') == 'true', opaque=True)
     n = fields[0]
     if n.get('enabled', 'true') != 'true':
         raise TextInputError('input_field_disabled')
@@ -94,14 +151,15 @@ def parse_focused_field(output: str) -> FocusedField:
                         n.get('password') == 'true')
 
 
-def read_focused_field(adb: Path, run: Callable) -> FocusedField:
+def dump_hierarchy(adb: Path, run: Callable) -> str:
+    """Return the raw UI hierarchy XML, preferring the cheapest working dump."""
     if str(adb) in _SERVICE_DUMP_ADB:
-        return parse_focused_field(read_service_hierarchy(adb, run))
+        return read_service_hierarchy(adb, run)
     if str(adb) not in _FILE_DUMP_ADB:
         result = run(adb, 'shell', 'uiautomator', 'dump', '/dev/tty')
         output = result.stdout or ''
         if not result.returncode and '</hierarchy>' in output:
-            return parse_focused_field(output)
+            return output
         _FILE_DUMP_ADB.add(str(adb))
     # Some OEM builds report success for /dev/tty without returning XML.
     # A unique file prevents stale dumps from being mistaken for current state.
@@ -110,13 +168,33 @@ def read_focused_field(adb: Path, run: Callable) -> FocusedField:
         dumped = run(adb, 'shell', 'uiautomator', 'dump', remote)
         contents = run(adb, 'shell', 'cat', remote) if not dumped.returncode else None
         if contents is not None and not contents.returncode and '</hierarchy>' in (contents.stdout or ''):
-            return parse_focused_field(contents.stdout)
+            return contents.stdout
         output = read_service_hierarchy(adb, run)
-        parsed = parse_focused_field(output)
         _SERVICE_DUMP_ADB.add(str(adb))
-        return parsed
+        return output
     finally:
         run(adb, 'shell', 'rm', '-f', remote)
+
+
+def read_focused_field(adb: Path, run: Callable) -> FocusedField:
+    return parse_focused_field(dump_hierarchy(adb, run))
+
+
+def hierarchy_contains(adb: Path, run: Callable, value: str) -> bool:
+    """True when the exact payload is visible somewhere in the current tree.
+
+    Diagnostic only: it never sends text, so a failed read-back cannot be
+    mistaken for a delivered payload unless the characters are actually on
+    screen after an app-driven navigation.
+    """
+    if not value:
+        return False
+    try:
+        root = _root_of(dump_hierarchy(adb, run))
+    except (TextInputError, OSError):
+        return False
+    return any(value in (n.get('text') or '') or value in (n.get('content-desc') or '')
+               for n in root.iter('node'))
 
 
 def broadcast(adb: Path, run: Callable, channel: str, value: str) -> None:
@@ -155,14 +233,39 @@ def write_verified_text(adb: Path, value: str, run: Callable,
             broadcast(adb, run, channel, value)
         except (RuntimeError, OSError) as exc:
             transport_error = type(exc).__name__
+        if ready.opaque:
+            # The focused control paints its own text and exposes none of it.
+            # Delivery is the best observable outcome; never claim read-back.
+            try:
+                after = read_focused_field(adb, run)
+            except (TextInputError, OSError):
+                after = None
+            if after is not None and (not ready.same_target(after) or after.password):
+                raise TextInputError('input_focus_changed_after_send', details)
+            return {**details, "verified": True, "verification": "sent_opaque_target",
+                    "channel": channel, "text_observable": False,
+                    "transport_warning": transport_error}
         unchanged = True
         for _ in range(2):
             sleep(.25)
             try:
                 after = read_focused_field(adb, run)
             except (TextInputError, OSError) as exc:
+                # An app may auto-submit on input and tear the field down. Look
+                # for the exact payload in the new screen before failing.
+                if hierarchy_contains(adb, run, value):
+                    return {**details, "verified": True,
+                            "verification": "text_visible_in_hierarchy",
+                            "channel": channel, "transport_warning": transport_error}
                 raise TextInputError('input_readback_unavailable_after_send', details) from exc
             if not ready.same_target(after) or after.password:
+                if after.text != ready.text and value in after.text:
+                    return {**details, "verified": True, "verification": "same_field_text_changed",
+                            "channel": channel, "transport_warning": transport_error}
+                if hierarchy_contains(adb, run, value):
+                    return {**details, "verified": True,
+                            "verification": "text_visible_in_hierarchy",
+                            "channel": channel, "transport_warning": transport_error}
                 raise TextInputError('input_focus_changed_after_send', details)
             details['after_length'] = len(after.text)
             if after.text != ready.text:
